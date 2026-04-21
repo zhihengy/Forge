@@ -17,7 +17,7 @@ class TrainingEngineArgs:
     max_train_steps: int = 1000
     num_train_epochs: int = 1
     seed: int = 42
-    dp_mode: str = "fsdp1"
+    dp_mode: str = "fsdp2"
     sequence_parallel_mode: str = "none"
     sequence_parallel_degree: int = 1
     attention_backend: str = "native"

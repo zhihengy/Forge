@@ -41,7 +41,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 
 from forge.core import create_core
 from forge.objectives.flow_match import FlowMatchObjective
-from forge.parallel.config import ParallelConfig, SequenceParallelConfig
+from forge.parallel.config import ParallelConfig, ParameterParallelConfig, SequenceParallelConfig
 
 
 def find_free_port() -> int:
@@ -134,7 +134,7 @@ def run_gpu_preflight(world_size: int, min_free_gb_per_gpu: float) -> dict[str, 
     if len(visible_gpus) < world_size:
         return {
             "status": "error",
-            "error": f"Visible CUDA devices ({len(visible_gpus)}) < ulysses_world_size ({world_size})",
+            "error": f"Visible CUDA devices ({len(visible_gpus)}) < world_size ({world_size})",
             "visible_gpus": visible_gpus,
         }
 
@@ -170,6 +170,25 @@ def build_sequence_parallel_config(*, world_size: int, attention_backend: str) -
     )
 
 
+def build_parallel_config(
+    *,
+    world_size: int,
+    attention_backend: str,
+    use_fsdp: bool,
+    use_ulysses: bool,
+) -> ParallelConfig:
+    return ParallelConfig(
+        backend="torch",
+        dp_mode="fsdp2" if use_fsdp else "none",
+        parameter_parallel=ParameterParallelConfig(mode="fsdp2" if use_fsdp else "none", degree=world_size if use_fsdp else 1),
+        sequence_parallel=(
+            build_sequence_parallel_config(world_size=world_size, attention_backend=attention_backend)
+            if use_ulysses
+            else SequenceParallelConfig()
+        ),
+    )
+
+
 def summarize_loss_diffs(
     reference_losses: list[float],
     candidate_losses: list[float],
@@ -194,6 +213,26 @@ def dtype_name(dtype: torch.dtype) -> str:
     if dtype is torch.bfloat16:
         return "bf16"
     return str(dtype).replace("torch.", "")
+
+
+def build_benchmark_summary(
+    *,
+    duration_s: float,
+    steps: int,
+    batch_size: int,
+    diffusers_duration_s: float | None = None,
+    forge_single_duration_s: float | None = None,
+) -> dict[str, float]:
+    benchmark = {
+        "duration_s": duration_s,
+        "steps_per_s": steps / duration_s,
+        "samples_per_s": (steps * batch_size) / duration_s,
+    }
+    if diffusers_duration_s is not None:
+        benchmark["speedup_vs_diffusers_single"] = diffusers_duration_s / duration_s
+    if forge_single_duration_s is not None:
+        benchmark["speedup_vs_forge_single"] = forge_single_duration_s / duration_s
+    return benchmark
 
 
 def extract_rank_errors(result: dict[str, Any]) -> dict[str, Any]:
@@ -351,6 +390,8 @@ def forge_train(
     losses: list[float] = []
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    if core.parallel_runtime.is_distributed():
+        core.parallel_runtime.barrier()
     started = time.perf_counter()
 
     for raw_batch in clone_raw_batches(batches):
@@ -366,6 +407,8 @@ def forge_train(
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    if core.parallel_runtime.is_distributed():
+        core.parallel_runtime.barrier()
     duration_s = time.perf_counter() - started
 
     result = {
@@ -413,12 +456,18 @@ def run_single_gpu_precision_check(
         "reference_duration_s": direct["duration_s"],
         "candidate_duration_s": forge["duration_s"],
         "max_param_diff": max_state_dict_diff(direct["state_dict"], forge["state_dict"]),
+        "benchmark": build_benchmark_summary(
+            duration_s=forge["duration_s"],
+            steps=len(forge["losses"]),
+            batch_size=batches[0]["latents"].shape[0],
+            diffusers_duration_s=direct["duration_s"],
+        ),
     }
     summary.update(summarize_loss_diffs(direct["losses"], forge["losses"]))
     return summary
 
 
-def distributed_ulysses_worker(
+def distributed_mode_worker(
     rank: int,
     world_size: int,
     master_port: int,
@@ -432,6 +481,8 @@ def distributed_ulysses_worker(
     prompt_dim: int,
     seed: int,
     attention_backend: str,
+    use_fsdp: bool,
+    use_ulysses: bool,
     return_dict,
 ) -> None:
     try:
@@ -441,9 +492,9 @@ def distributed_ulysses_worker(
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["LOCAL_RANK"] = str(rank)
 
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
         device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=device)
 
         batches = make_raw_batches(
             steps=steps,
@@ -460,13 +511,11 @@ def distributed_ulysses_worker(
             batches=batches,
             device=device,
             learning_rate=TRAIN_LR,
-            parallel_config=ParallelConfig(
-                backend="torch",
-                dp_mode="none",
-                sequence_parallel=build_sequence_parallel_config(
-                    world_size=world_size,
-                    attention_backend=attention_backend,
-                ),
+            parallel_config=build_parallel_config(
+                world_size=world_size,
+                attention_backend=attention_backend,
+                use_fsdp=use_fsdp,
+                use_ulysses=use_ulysses,
             ),
             attention_backend=attention_backend,
         )
@@ -485,8 +534,10 @@ def distributed_ulysses_worker(
             dist.destroy_process_group()
 
 
-def run_ulysses_precision_check(
+def run_parallel_precision_check(
     *,
+    mode_name: str,
+    candidate_mode: str,
     model_dir: Path,
     steps: int,
     batch_size: int,
@@ -498,14 +549,18 @@ def run_ulysses_precision_check(
     seed: int,
     attention_backend: str,
     world_size: int,
+    use_fsdp: bool,
+    use_ulysses: bool,
     reference_losses: list[float],
+    reference_duration_s: float,
     single_gpu_losses: list[float],
+    single_gpu_duration_s: float,
 ) -> dict[str, Any]:
     manager = mp.Manager()
     return_dict = manager.dict()
     master_port = find_free_port()
     mp.spawn(
-        distributed_ulysses_worker,
+        distributed_mode_worker,
         args=(
             world_size,
             master_port,
@@ -519,6 +574,8 @@ def run_ulysses_precision_check(
             prompt_dim,
             seed,
             attention_backend,
+            use_fsdp,
+            use_ulysses,
             return_dict,
         ),
         nprocs=world_size,
@@ -528,7 +585,7 @@ def run_ulysses_precision_check(
     if result.get("status") != "success":
         summary = {
             "status": result.get("status", "error"),
-            "candidate_mode": "forge_ulysses",
+            "candidate_mode": candidate_mode,
             "world_size": world_size,
             "error": result.get("error"),
         }
@@ -539,11 +596,18 @@ def run_ulysses_precision_check(
     summary = {
         "status": "success",
         "reference_mode": "diffusers_single_gpu",
-        "candidate_mode": "forge_ulysses",
+        "candidate_mode": candidate_mode,
         "reference_precision": dtype_name(TRAIN_DTYPE),
         "candidate_precision": result["precision"],
         "world_size": world_size,
         "candidate_duration_s": result["duration_s"],
+        "benchmark": build_benchmark_summary(
+            duration_s=result["duration_s"],
+            steps=steps,
+            batch_size=batch_size,
+            diffusers_duration_s=reference_duration_s,
+            forge_single_duration_s=single_gpu_duration_s,
+        ),
     }
     summary.update(summarize_loss_diffs(reference_losses, candidate_losses))
     summary["vs_forge_single"] = summarize_loss_diffs(single_gpu_losses, candidate_losses)
@@ -566,7 +630,7 @@ def main() -> None:
     parser.add_argument("--joint-dim", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--attention-backend", type=str, default="native")
-    parser.add_argument("--ulysses-world-size", type=int, default=2)
+    parser.add_argument("--world-size", "--ulysses-world-size", dest="world_size", type=int, default=2)
     parser.add_argument("--min-free-gb-per-gpu", type=float, default=60.0)
     args = parser.parse_args()
 
@@ -595,7 +659,7 @@ def main() -> None:
         joint_dim=args.joint_dim,
     )
 
-    preflight = run_gpu_preflight(args.ulysses_world_size, args.min_free_gb_per_gpu)
+    preflight = run_gpu_preflight(args.world_size, args.min_free_gb_per_gpu)
     if preflight["status"] != "success":
         raise RuntimeError(preflight["error"])
 
@@ -617,8 +681,10 @@ def main() -> None:
         device=device,
         attention_backend=args.attention_backend,
     )
-    ulysses_summary = run_ulysses_precision_check(
+    fsdp_summary = run_parallel_precision_check(
         model_dir=model_dir,
+        mode_name="fsdp",
+        candidate_mode="forge_fsdp2",
         steps=args.steps,
         batch_size=args.batch_size,
         height=args.height,
@@ -628,15 +694,66 @@ def main() -> None:
         prompt_dim=args.joint_dim,
         seed=args.seed,
         attention_backend=args.attention_backend,
-        world_size=args.ulysses_world_size,
+        world_size=args.world_size,
+        use_fsdp=True,
+        use_ulysses=False,
         reference_losses=single_gpu_summary["reference_losses"],
+        reference_duration_s=single_gpu_summary["reference_duration_s"],
         single_gpu_losses=single_gpu_summary["candidate_losses"],
+        single_gpu_duration_s=single_gpu_summary["candidate_duration_s"],
+    )
+    ulysses_summary = run_parallel_precision_check(
+        model_dir=model_dir,
+        mode_name="ulysses",
+        candidate_mode="forge_ulysses",
+        steps=args.steps,
+        batch_size=args.batch_size,
+        height=args.height,
+        width=args.width,
+        prompt_len=args.prompt_len,
+        latent_channels=args.latent_channels,
+        prompt_dim=args.joint_dim,
+        seed=args.seed,
+        attention_backend=args.attention_backend,
+        world_size=args.world_size,
+        use_fsdp=False,
+        use_ulysses=True,
+        reference_losses=single_gpu_summary["reference_losses"],
+        reference_duration_s=single_gpu_summary["reference_duration_s"],
+        single_gpu_losses=single_gpu_summary["candidate_losses"],
+        single_gpu_duration_s=single_gpu_summary["candidate_duration_s"],
+    )
+    fsdp_ulysses_summary = run_parallel_precision_check(
+        model_dir=model_dir,
+        mode_name="fsdp_ulysses",
+        candidate_mode="forge_fsdp2_ulysses",
+        steps=args.steps,
+        batch_size=args.batch_size,
+        height=args.height,
+        width=args.width,
+        prompt_len=args.prompt_len,
+        latent_channels=args.latent_channels,
+        prompt_dim=args.joint_dim,
+        seed=args.seed,
+        attention_backend=args.attention_backend,
+        world_size=args.world_size,
+        use_fsdp=True,
+        use_ulysses=True,
+        reference_losses=single_gpu_summary["reference_losses"],
+        reference_duration_s=single_gpu_summary["reference_duration_s"],
+        single_gpu_losses=single_gpu_summary["candidate_losses"],
+        single_gpu_duration_s=single_gpu_summary["candidate_duration_s"],
     )
 
     summary = {
         "status": (
             "success"
-            if single_gpu_summary["status"] == "success" and ulysses_summary["status"] == "success"
+            if (
+                single_gpu_summary["status"] == "success"
+                and fsdp_summary["status"] == "success"
+                and ulysses_summary["status"] == "success"
+                and fsdp_ulysses_summary["status"] == "success"
+            )
             else "error"
         ),
         "model_dir": str(model_dir),
@@ -655,13 +772,15 @@ def main() -> None:
             "joint_dim": args.joint_dim,
             "attention_backend": args.attention_backend,
             "precision": dtype_name(TRAIN_DTYPE),
-            "ulysses_world_size": args.ulysses_world_size,
+            "world_size": args.world_size,
             "min_free_gb_per_gpu": args.min_free_gb_per_gpu,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
         "preflight": preflight,
         "single_gpu": single_gpu_summary,
+        "fsdp": fsdp_summary,
         "ulysses": ulysses_summary,
+        "fsdp_ulysses": fsdp_ulysses_summary,
     }
 
     output_path = args.output_dir / "qwen_image_m2_precision_summary.json"

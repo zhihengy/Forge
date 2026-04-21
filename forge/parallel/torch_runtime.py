@@ -5,8 +5,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 
 from forge.parallel.base import ParallelRuntime
 from forge.parallel.plan import ParallelPlan, StrategySpec
@@ -22,9 +22,6 @@ class TorchParallelRuntime(ParallelRuntime):
         return None
 
     def parallelize_model(self, model: Any, plan: ParallelPlan) -> Any:
-        if plan.parameter_degree > 1 and plan.sequence_degree > 1:
-            raise NotImplementedError("Combined FSDP + sequence parallel is not implemented yet.")
-
         self.use_fsdp = False
         self.sequence_parallel_group = None
 
@@ -35,7 +32,7 @@ class TorchParallelRuntime(ParallelRuntime):
         if sequence_strategy is not None:
             self._apply_native_sequence_parallel(model, sequence_strategy)
 
-        fsdp_strategy = plan.get_strategy("fsdp1")
+        fsdp_strategy = plan.get_strategy("fsdp2")
         if fsdp_strategy is not None:
             model = self._apply_fsdp(model, fsdp_strategy, device)
 
@@ -51,6 +48,8 @@ class TorchParallelRuntime(ParallelRuntime):
         return batch
 
     def backward(self, loss: Any) -> None:
+        if self.use_fsdp and self.sequence_parallel_group is not None and self.is_distributed():
+            loss = loss * dist.get_world_size(self.sequence_parallel_group)
         loss.backward()
 
     def step(self, optimizer: Any, scheduler: Any | None = None) -> None:
@@ -106,13 +105,10 @@ class TorchParallelRuntime(ParallelRuntime):
             raise NotImplementedError("FSDP currently expects the parameter-parallel degree to match world_size.")
 
         self.use_fsdp = True
-        return FSDP(
-            model,
-            device_id=device,
-            use_orig_params=True,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            sync_module_states=True,
-        )
+        mesh = init_device_mesh(device.type, (world_size,))
+        for block in getattr(model, "transformer_blocks", ()):
+            fully_shard(block, mesh=mesh)
+        return fully_shard(model, mesh=mesh, reshard_after_forward=False)
 
     def _sync_sequence_parallel_gradients(self, optimizer: Any) -> None:
         if self.sequence_parallel_group is None or self.use_fsdp or not self.is_distributed():

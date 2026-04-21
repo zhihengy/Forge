@@ -9,7 +9,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 from forge.adapters.qwen_image import QwenImageCheckpointAdapter
 from forge.architectures.qwen_image import QwenImageArchitecture
 from forge.batch import DenoiseBatch
-from forge.parallel.config import ParallelConfig, resolve_context_parallel_degrees
+from forge.parallel.config import ParallelConfig
 from forge.parallel.plan import ParallelPlan, StrategySpec
 from forge.runtimes.base import ModelRuntime
 
@@ -98,10 +98,10 @@ class QwenImageRuntime(ModelRuntime):
         required_batch_extras: set[str] = set()
 
         parameter_parallel = parallel_config.parameter_parallel
-        if parameter_parallel is not None and parameter_parallel.mode == "fsdp1":
+        if parameter_parallel is not None and parameter_parallel.mode == "fsdp2" and parameter_parallel.degree > 1:
             strategies.append(
                 StrategySpec(
-                    kind="fsdp1",
+                    kind="fsdp2",
                     config={"degree": parameter_parallel.degree},
                 )
             )
@@ -118,10 +118,6 @@ class QwenImageRuntime(ModelRuntime):
                         f"Unsupported native sequence-parallel algorithm '{algorithm}'. "
                         f"Supported: {native_spec.supported_algorithms}"
                     )
-                _, ulysses_degree = resolve_context_parallel_degrees(
-                    algorithm=algorithm,
-                    degree=sequence_parallel.degree,
-                )
                 strategies.insert(
                     0,
                     StrategySpec(
@@ -129,7 +125,6 @@ class QwenImageRuntime(ModelRuntime):
                         config={
                             "degree": sequence_parallel.degree,
                             "algorithm": algorithm,
-                            "ulysses_degree": ulysses_degree,
                             "attention_backend": sequence_parallel.attention_backend,
                         },
                     ),
