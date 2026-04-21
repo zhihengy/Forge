@@ -32,7 +32,6 @@ class SequenceParallelConfig:
 class ParallelConfig:
     backend: str = "torch"
     dp_mode: str = "fsdp1"
-    mixed_precision: str = "bf16"
     parameter_parallel: ParameterParallelConfig | None = None
     sequence_parallel: SequenceParallelConfig = field(default_factory=SequenceParallelConfig)
 

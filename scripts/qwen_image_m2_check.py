@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "m2_qwen_image_check"
 VENDORED_DIFFUSERS_SRC = ROOT / "diffusers" / "src"
 TRAIN_LR = 1e-4
+TRAIN_DTYPE = torch.float32
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if VENDORED_DIFFUSERS_SRC.exists():
@@ -40,7 +41,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 
 from forge.core import create_core
 from forge.objectives.flow_match import FlowMatchObjective
-from forge.parallel.config import ParallelConfig, SequenceParallelConfig, resolve_context_parallel_degrees
+from forge.parallel.config import ParallelConfig, SequenceParallelConfig
 
 
 def find_free_port() -> int:
@@ -133,7 +134,7 @@ def run_gpu_preflight(world_size: int, min_free_gb_per_gpu: float) -> dict[str, 
     if len(visible_gpus) < world_size:
         return {
             "status": "error",
-            "error": f"Visible CUDA devices ({len(visible_gpus)}) < sp_world_size ({world_size})",
+            "error": f"Visible CUDA devices ({len(visible_gpus)}) < ulysses_world_size ({world_size})",
             "visible_gpus": visible_gpus,
         }
 
@@ -160,14 +161,7 @@ def run_gpu_preflight(world_size: int, min_free_gb_per_gpu: float) -> dict[str, 
     }
 
 
-def build_sequence_parallel_config(
-    *,
-    sp_algorithm: str,
-    world_size: int,
-    attention_backend: str,
-) -> SequenceParallelConfig:
-    if sp_algorithm != "ulysses":
-        raise ValueError(f"Unsupported SP algorithm: {sp_algorithm}. This script only validates self-owned ulysses.")
+def build_sequence_parallel_config(*, world_size: int, attention_backend: str) -> SequenceParallelConfig:
     return SequenceParallelConfig(
         mode="native",
         algorithm="ulysses",
@@ -180,7 +174,9 @@ def summarize_loss_diffs(
     reference_losses: list[float],
     candidate_losses: list[float],
 ) -> dict[str, Any]:
-    per_step_abs_diff = [abs(reference - candidate) for reference, candidate in zip(reference_losses, candidate_losses, strict=True)]
+    per_step_abs_diff = [
+        abs(reference - candidate) for reference, candidate in zip(reference_losses, candidate_losses, strict=True)
+    ]
     return {
         "reference_losses": reference_losses,
         "candidate_losses": candidate_losses,
@@ -188,6 +184,16 @@ def summarize_loss_diffs(
         "max_abs_diff": max(per_step_abs_diff) if per_step_abs_diff else 0.0,
         "mean_abs_diff": (sum(per_step_abs_diff) / len(per_step_abs_diff)) if per_step_abs_diff else 0.0,
     }
+
+
+def dtype_name(dtype: torch.dtype) -> str:
+    if dtype is torch.float32:
+        return "fp32"
+    if dtype is torch.float16:
+        return "fp16"
+    if dtype is torch.bfloat16:
+        return "bf16"
+    return str(dtype).replace("torch.", "")
 
 
 def extract_rank_errors(result: dict[str, Any]) -> dict[str, Any]:
@@ -259,12 +265,11 @@ def direct_diffusers_train(
     model_dir: Path,
     batches: list[dict[str, Any]],
     device: torch.device,
-    dtype: torch.dtype,
     learning_rate: float,
     attention_backend: str,
 ) -> dict[str, Any]:
     model = QwenImageTransformer2DModel.from_pretrained(model_dir, subfolder="transformer")
-    model.to(device=device, dtype=dtype)
+    model.to(device=device)
     model.set_attention_backend(attention_backend)
     model.train()
 
@@ -278,16 +283,16 @@ def direct_diffusers_train(
     started = time.perf_counter()
 
     for raw_batch in clone_raw_batches(batches):
-        latents = raw_batch["latents"].to(device=device, dtype=dtype)
-        prompt_embeds = raw_batch["prompt_embeds"].to(device=device, dtype=dtype)
+        latents = raw_batch["latents"].to(device=device)
+        prompt_embeds = raw_batch["prompt_embeds"].to(device=device)
         attention_mask = raw_batch["encoder_hidden_states_mask"].to(device=device)
-        noise = raw_batch["noise"].to(device=device, dtype=dtype)
+        noise = raw_batch["noise"].to(device=device)
         timesteps, step_indices = FlowMatchObjective._resolve_timesteps(
             raw_batch["timesteps"].to(device=device),
             scheduler,
             device,
         )
-        sigmas = scheduler.sigmas.to(device=device, dtype=dtype)[step_indices]
+        sigmas = scheduler.sigmas.to(device=device, dtype=latents.dtype)[step_indices]
         sigmas = sigmas.view(latents.shape[0], *([1] * (latents.ndim - 1)))
 
         noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
@@ -315,6 +320,7 @@ def direct_diffusers_train(
         "losses": losses,
         "duration_s": duration_s,
         "state_dict": clone_state_dict(model),
+        "precision": dtype_name(TRAIN_DTYPE),
     }
 
 
@@ -323,29 +329,24 @@ def forge_train(
     model_dir: Path,
     batches: list[dict[str, Any]],
     device: torch.device,
-    dtype: torch.dtype,
     learning_rate: float,
     parallel_config: ParallelConfig,
     attention_backend: str,
 ) -> dict[str, Any]:
     core = create_core(
-        model_family="qwen_image",
         model_name_or_path=str(model_dir),
         parallel_config=parallel_config,
     )
     model = core.model_runtime.build_model()
     core.model_runtime.load_weights(model)
-    model.to(device=device, dtype=dtype)
+    model.to(device=device)
     model.set_attention_backend(attention_backend)
     plan = core.model_runtime.make_parallel_plan(parallel_config)
     core.parallel_runtime.setup(plan)
     model = core.parallel_runtime.parallelize_model(model, plan)
     model.train()
 
-    optimizer = core.parallel_runtime.prepare_optimizer(
-        model,
-        torch.optim.AdamW(model.parameters(), lr=learning_rate),
-    )
+    optimizer = core.parallel_runtime.prepare_optimizer(torch.optim.AdamW(model.parameters(), lr=learning_rate))
 
     losses: list[float] = []
     if device.type == "cuda":
@@ -370,42 +371,24 @@ def forge_train(
     result = {
         "losses": losses,
         "duration_s": duration_s,
+        "precision": dtype_name(TRAIN_DTYPE),
     }
     if not core.parallel_runtime.is_distributed():
         result["state_dict"] = clone_state_dict(model)
     return result
 
 
-def run_alignment_check(
+def run_single_gpu_precision_check(
     *,
     model_dir: Path,
-    steps: int,
-    batch_size: int,
-    height: int,
-    width: int,
-    prompt_len: int,
-    latent_channels: int,
-    prompt_dim: int,
-    seed: int,
+    batches: list[dict[str, Any]],
     device: torch.device,
     attention_backend: str,
 ) -> dict[str, Any]:
-    batches = make_raw_batches(
-        steps=steps,
-        batch_size=batch_size,
-        height=height,
-        width=width,
-        prompt_len=prompt_len,
-        latent_channels=latent_channels,
-        prompt_dim=prompt_dim,
-        seed=seed,
-    )
-
     direct = direct_diffusers_train(
         model_dir=model_dir,
         batches=batches,
         device=device,
-        dtype=torch.float32,
         learning_rate=TRAIN_LR,
         attention_backend=attention_backend,
     )
@@ -413,29 +396,29 @@ def run_alignment_check(
         model_dir=model_dir,
         batches=batches,
         device=device,
-        dtype=torch.float32,
         learning_rate=TRAIN_LR,
         parallel_config=ParallelConfig(
             backend="torch",
             dp_mode="none",
-            mixed_precision="fp32",
         ),
         attention_backend=attention_backend,
     )
 
-    loss_diffs = [abs(a - b) for a, b in zip(direct["losses"], forge["losses"], strict=True)]
-    return {
+    summary = {
         "status": "success",
-        "direct_losses": direct["losses"],
-        "forge_losses": forge["losses"],
-        "max_loss_diff": max(loss_diffs) if loss_diffs else 0.0,
+        "reference_mode": "diffusers_single_gpu",
+        "candidate_mode": "forge_single_gpu",
+        "reference_precision": direct["precision"],
+        "candidate_precision": forge["precision"],
+        "reference_duration_s": direct["duration_s"],
+        "candidate_duration_s": forge["duration_s"],
         "max_param_diff": max_state_dict_diff(direct["state_dict"], forge["state_dict"]),
-        "direct_duration_s": direct["duration_s"],
-        "forge_duration_s": forge["duration_s"],
     }
+    summary.update(summarize_loss_diffs(direct["losses"], forge["losses"]))
+    return summary
 
 
-def distributed_sp_worker(
+def distributed_ulysses_worker(
     rank: int,
     world_size: int,
     master_port: int,
@@ -449,7 +432,6 @@ def distributed_sp_worker(
     prompt_dim: int,
     seed: int,
     attention_backend: str,
-    sp_algorithm: str,
     return_dict,
 ) -> None:
     try:
@@ -477,14 +459,11 @@ def distributed_sp_worker(
             model_dir=Path(model_dir),
             batches=batches,
             device=device,
-            dtype=torch.bfloat16,
             learning_rate=TRAIN_LR,
             parallel_config=ParallelConfig(
                 backend="torch",
                 dp_mode="none",
-                mixed_precision="bf16",
                 sequence_parallel=build_sequence_parallel_config(
-                    sp_algorithm=sp_algorithm,
                     world_size=world_size,
                     attention_backend=attention_backend,
                 ),
@@ -495,6 +474,7 @@ def distributed_sp_worker(
             return_dict["status"] = "success"
             return_dict["duration_s"] = result["duration_s"]
             return_dict["losses"] = result["losses"]
+            return_dict["precision"] = result["precision"]
     except Exception as error:  # noqa: BLE001
         return_dict[f"rank_{rank}_error"] = repr(error)
         if "status" not in return_dict:
@@ -505,7 +485,7 @@ def distributed_sp_worker(
             dist.destroy_process_group()
 
 
-def run_native_sp(
+def run_ulysses_precision_check(
     *,
     model_dir: Path,
     steps: int,
@@ -516,15 +496,16 @@ def run_native_sp(
     latent_channels: int,
     prompt_dim: int,
     seed: int,
-    world_size: int,
     attention_backend: str,
-    sp_algorithm: str,
+    world_size: int,
+    reference_losses: list[float],
+    single_gpu_losses: list[float],
 ) -> dict[str, Any]:
     manager = mp.Manager()
     return_dict = manager.dict()
     master_port = find_free_port()
     mp.spawn(
-        distributed_sp_worker,
+        distributed_ulysses_worker,
         args=(
             world_size,
             master_port,
@@ -538,182 +519,40 @@ def run_native_sp(
             prompt_dim,
             seed,
             attention_backend,
-            sp_algorithm,
             return_dict,
         ),
         nprocs=world_size,
         join=True,
     )
-    return dict(return_dict)
+    result = dict(return_dict)
+    if result.get("status") != "success":
+        summary = {
+            "status": result.get("status", "error"),
+            "candidate_mode": "forge_ulysses",
+            "world_size": world_size,
+            "error": result.get("error"),
+        }
+        summary.update(extract_rank_errors(result))
+        return summary
 
-
-def run_sp_precision_comparison(
-    *,
-    model_dir: Path,
-    steps: int,
-    batch_size: int,
-    height: int,
-    width: int,
-    prompt_len: int,
-    latent_channels: int,
-    prompt_dim: int,
-    seed: int,
-    attention_backend: str,
-    device: torch.device,
-    sp_algorithm: str,
-    world_size: int,
-    baseline_result: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if baseline_result is None:
-        batches = make_raw_batches(
-            steps=steps,
-            batch_size=batch_size,
-            height=height,
-            width=width,
-            prompt_len=prompt_len,
-            latent_channels=latent_channels,
-            prompt_dim=prompt_dim,
-            seed=seed,
-        )
-        baseline = forge_train(
-            model_dir=model_dir,
-            batches=batches,
-            device=device,
-            dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-            learning_rate=TRAIN_LR,
-            parallel_config=ParallelConfig(
-                backend="torch",
-                dp_mode="none",
-                mixed_precision="bf16" if device.type == "cuda" else "fp32",
-            ),
-            attention_backend=attention_backend,
-        )
-    else:
-        baseline = baseline_result
-    sp_result = run_native_sp(
-        model_dir=model_dir,
-        steps=steps,
-        batch_size=batch_size,
-        height=height,
-        width=width,
-        prompt_len=prompt_len,
-        latent_channels=latent_channels,
-        prompt_dim=prompt_dim,
-        seed=seed,
-        world_size=world_size,
-        attention_backend=attention_backend,
-        sp_algorithm=sp_algorithm,
-    )
-
-    _, resolved_ulysses_degree = resolve_context_parallel_degrees(
-        algorithm=sp_algorithm,
-        degree=world_size,
-    )
+    candidate_losses = list(result["losses"])
     summary = {
-        "status": sp_result.get("status", "error"),
-        "algorithm": sp_algorithm,
+        "status": "success",
+        "reference_mode": "diffusers_single_gpu",
+        "candidate_mode": "forge_ulysses",
+        "reference_precision": dtype_name(TRAIN_DTYPE),
+        "candidate_precision": result["precision"],
         "world_size": world_size,
-        "ulysses_degree": resolved_ulysses_degree,
-        "baseline_duration_s": baseline["duration_s"],
-        "baseline_losses": baseline["losses"],
-        "sp_duration_s": sp_result.get("duration_s"),
-        "sp_losses": sp_result.get("losses"),
+        "candidate_duration_s": result["duration_s"],
     }
-    if sp_result.get("status") == "success":
-        summary.update(
-            summarize_loss_diffs(
-                baseline["losses"],
-                list(sp_result["losses"]),
-            )
-        )
-    else:
-        summary["error"] = sp_result.get("error")
-        summary.update(extract_rank_errors(sp_result))
-    return summary
-
-
-def run_benchmark(
-    *,
-    model_dir: Path,
-    steps: int,
-    batch_size: int,
-    height: int,
-    width: int,
-    prompt_len: int,
-    latent_channels: int,
-    prompt_dim: int,
-    seed: int,
-    attention_backend: str,
-    sp_algorithm: str,
-    world_size: int,
-    device: torch.device,
-) -> dict[str, Any]:
-    batches = make_raw_batches(
-        steps=steps,
-        batch_size=batch_size,
-        height=height,
-        width=width,
-        prompt_len=prompt_len,
-        latent_channels=latent_channels,
-        prompt_dim=prompt_dim,
-        seed=seed,
-    )
-    direct = direct_diffusers_train(
-        model_dir=model_dir,
-        batches=batches,
-        device=device,
-        dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        learning_rate=TRAIN_LR,
-        attention_backend=attention_backend,
-    )
-    forge_single = forge_train(
-        model_dir=model_dir,
-        batches=batches,
-        device=device,
-        dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-        learning_rate=TRAIN_LR,
-        parallel_config=ParallelConfig(
-            backend="torch",
-            dp_mode="none",
-            mixed_precision="bf16" if device.type == "cuda" else "fp32",
-        ),
-        attention_backend=attention_backend,
-    )
-    forge_sp = run_native_sp(
-        model_dir=model_dir,
-        steps=steps,
-        batch_size=batch_size,
-        height=height,
-        width=width,
-        prompt_len=prompt_len,
-        latent_channels=latent_channels,
-        prompt_dim=prompt_dim,
-        seed=seed,
-        world_size=world_size,
-        attention_backend=attention_backend,
-        sp_algorithm=sp_algorithm,
-    )
-    summary = {
-        "status": forge_sp.get("status", "error"),
-        "direct_diffusers_single_gpu_s": direct["duration_s"],
-        "forge_single_gpu_s": forge_single["duration_s"],
-        "forge_native_sp_s": forge_sp.get("duration_s"),
-        "forge_native_sp_losses": forge_sp.get("losses"),
-    }
-    if forge_sp.get("duration_s") is not None:
-        summary["speedup_vs_direct"] = direct["duration_s"] / forge_sp["duration_s"]
-        summary["speedup_vs_forge_single"] = forge_single["duration_s"] / forge_sp["duration_s"]
-    if forge_sp.get("status") == "error":
-        summary["error"] = forge_sp.get("error")
-        summary.update(extract_rank_errors(forge_sp))
+    summary.update(summarize_loss_diffs(reference_losses, candidate_losses))
+    summary["vs_forge_single"] = summarize_loss_diffs(single_gpu_losses, candidate_losses)
     return summary
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="QwenImage Forge M2 stress smoke/alignment/benchmark script.")
+    parser = argparse.ArgumentParser(description="QwenImage Forge precision comparison against diffusers.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--smoke-steps", type=int, default=2)
-    parser.add_argument("--alignment-steps", type=int, default=2)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--height", type=int, default=64)
@@ -727,10 +566,7 @@ def main() -> None:
     parser.add_argument("--joint-dim", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--attention-backend", type=str, default="native")
-    parser.add_argument("--sp-algorithm", type=str, default="ulysses")
-    parser.add_argument("--sp-world-size", type=int, default=2)
-    parser.add_argument("--compare-sp-precision", action="store_true")
-    parser.add_argument("--ulysses-world-size", type=int, default=4)
+    parser.add_argument("--ulysses-world-size", type=int, default=2)
     parser.add_argument("--min-free-gb-per-gpu", type=float, default=60.0)
     args = parser.parse_args()
 
@@ -740,6 +576,9 @@ def main() -> None:
         raise ValueError(
             f"latent_channels ({args.latent_channels}) must be divisible by patch_size^2 ({patch_area})"
         )
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        raise RuntimeError("This precision check expects at least one visible CUDA device.")
+
     out_channels = args.latent_channels // patch_area
     model_slug = (
         f"synthetic_qwen_image_p{args.patch_size}_c{args.latent_channels}"
@@ -756,122 +595,12 @@ def main() -> None:
         joint_dim=args.joint_dim,
     )
 
-    required_world_sizes = [args.sp_world_size]
-    if args.compare_sp_precision:
-        required_world_sizes.append(args.ulysses_world_size)
-    preflight = run_gpu_preflight(max(required_world_sizes), args.min_free_gb_per_gpu)
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-        raise RuntimeError("This script expects at least one visible CUDA device.")
+    preflight = run_gpu_preflight(args.ulysses_world_size, args.min_free_gb_per_gpu)
+    if preflight["status"] != "success":
+        raise RuntimeError(preflight["error"])
 
-    device = torch.device("cuda", 0)
-    smoke_summary: dict[str, Any]
-    benchmark_summary: dict[str, Any]
-    precision_summary: dict[str, Any]
-
-    if preflight["status"] == "success":
-        smoke_summary = run_native_sp(
-            model_dir=model_dir,
-            steps=args.smoke_steps,
-            batch_size=args.batch_size,
-            height=args.height,
-            width=args.width,
-            prompt_len=args.prompt_len,
-            latent_channels=args.latent_channels,
-            prompt_dim=args.joint_dim,
-            seed=args.seed,
-            world_size=args.sp_world_size,
-            attention_backend=args.attention_backend,
-            sp_algorithm=args.sp_algorithm,
-        )
-        benchmark_summary = run_benchmark(
-            model_dir=model_dir,
-            steps=args.steps,
-            batch_size=args.batch_size,
-            height=args.height,
-            width=args.width,
-            prompt_len=args.prompt_len,
-            latent_channels=args.latent_channels,
-            prompt_dim=args.joint_dim,
-            seed=args.seed,
-            attention_backend=args.attention_backend,
-            sp_algorithm=args.sp_algorithm,
-            world_size=args.sp_world_size,
-            device=device,
-        )
-        if args.compare_sp_precision:
-            precision_batches = make_raw_batches(
-                steps=args.steps,
-                batch_size=args.batch_size,
-                height=args.height,
-                width=args.width,
-                prompt_len=args.prompt_len,
-                latent_channels=args.latent_channels,
-                prompt_dim=args.joint_dim,
-                seed=args.seed,
-            )
-            baseline_result = forge_train(
-                model_dir=model_dir,
-                batches=precision_batches,
-                device=device,
-                dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
-                learning_rate=TRAIN_LR,
-                parallel_config=ParallelConfig(
-                    backend="torch",
-                    dp_mode="none",
-                    mixed_precision="bf16" if device.type == "cuda" else "fp32",
-                ),
-                attention_backend=args.attention_backend,
-            )
-            precision_comparisons = {
-                "ulysses": run_sp_precision_comparison(
-                    model_dir=model_dir,
-                    steps=args.steps,
-                    batch_size=args.batch_size,
-                    height=args.height,
-                    width=args.width,
-                    prompt_len=args.prompt_len,
-                    latent_channels=args.latent_channels,
-                    prompt_dim=args.joint_dim,
-                    seed=args.seed,
-                    attention_backend=args.attention_backend,
-                    device=device,
-                    sp_algorithm="ulysses",
-                    world_size=args.ulysses_world_size,
-                    baseline_result=baseline_result,
-                ),
-            }
-            statuses = {name: result["status"] for name, result in precision_comparisons.items()}
-            precision_summary = {
-                "status": "success" if all(status == "success" for status in statuses.values()) else "error",
-                "reference": {
-                    "mode": "forge_single_gpu",
-                    "duration_s": baseline_result["duration_s"],
-                    "losses": baseline_result["losses"],
-                },
-                "comparisons": precision_comparisons,
-            }
-        else:
-            precision_summary = {
-                "status": "skipped",
-                "error": "compare_sp_precision is disabled.",
-            }
-    else:
-        smoke_summary = {
-            "status": "skipped",
-            "error": preflight["error"],
-        }
-        benchmark_summary = {
-            "status": "skipped",
-            "error": smoke_summary["error"],
-        }
-        precision_summary = {
-            "status": "skipped",
-            "error": smoke_summary["error"],
-        }
-
-    alignment_summary = run_alignment_check(
-        model_dir=model_dir,
-        steps=args.alignment_steps,
+    batches = make_raw_batches(
+        steps=args.steps,
         batch_size=args.batch_size,
         height=args.height,
         width=args.width,
@@ -879,16 +608,40 @@ def main() -> None:
         latent_channels=args.latent_channels,
         prompt_dim=args.joint_dim,
         seed=args.seed,
+    )
+    device = torch.device("cuda", 0)
+
+    single_gpu_summary = run_single_gpu_precision_check(
+        model_dir=model_dir,
+        batches=batches,
         device=device,
         attention_backend=args.attention_backend,
     )
+    ulysses_summary = run_ulysses_precision_check(
+        model_dir=model_dir,
+        steps=args.steps,
+        batch_size=args.batch_size,
+        height=args.height,
+        width=args.width,
+        prompt_len=args.prompt_len,
+        latent_channels=args.latent_channels,
+        prompt_dim=args.joint_dim,
+        seed=args.seed,
+        attention_backend=args.attention_backend,
+        world_size=args.ulysses_world_size,
+        reference_losses=single_gpu_summary["reference_losses"],
+        single_gpu_losses=single_gpu_summary["candidate_losses"],
+    )
 
     summary = {
+        "status": (
+            "success"
+            if single_gpu_summary["status"] == "success" and ulysses_summary["status"] == "success"
+            else "error"
+        ),
         "model_dir": str(model_dir),
         "config": {
-            "smoke_steps": args.smoke_steps,
-            "alignment_steps": args.alignment_steps,
-            "benchmark_steps": args.steps,
+            "steps": args.steps,
             "batch_size": args.batch_size,
             "height": args.height,
             "width": args.width,
@@ -901,21 +654,17 @@ def main() -> None:
             "head_dim": args.head_dim,
             "joint_dim": args.joint_dim,
             "attention_backend": args.attention_backend,
-            "sp_algorithm": args.sp_algorithm,
-            "sp_world_size": args.sp_world_size,
-            "compare_sp_precision": args.compare_sp_precision,
+            "precision": dtype_name(TRAIN_DTYPE),
             "ulysses_world_size": args.ulysses_world_size,
             "min_free_gb_per_gpu": args.min_free_gb_per_gpu,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
         "preflight": preflight,
-        "smoke": smoke_summary,
-        "alignment": alignment_summary,
-        "benchmark": benchmark_summary,
-        "sp_precision": precision_summary,
+        "single_gpu": single_gpu_summary,
+        "ulysses": ulysses_summary,
     }
 
-    output_path = args.output_dir / "qwen_image_m2_stress_summary.json"
+    output_path = args.output_dir / "qwen_image_m2_precision_summary.json"
     output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
     print(f"summary_written={output_path}", flush=True)

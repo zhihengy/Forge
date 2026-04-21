@@ -20,29 +20,21 @@ class QwenImageRuntime(ModelRuntime):
         transformer_config = self.checkpoint_adapter.load_config(model_name_or_path)
         model_config = self.checkpoint_adapter.build_model_config(transformer_config)
         self.model_name_or_path = model_name_or_path
-        self.architecture = QwenImageArchitecture(
-            model_name_or_path=model_name_or_path,
-            model_config=model_config,
-        )
-        self.runtime_modules: dict[str, Any] = {}
+        self.architecture = QwenImageArchitecture(model_config=model_config)
+        self.noise_scheduler: FlowMatchEulerDiscreteScheduler | None = None
 
     def build_model(self) -> nn.Module:
         return self.architecture.build_model()
 
-    def load_weights(self, model: nn.Module) -> dict[str, Any]:
+    def load_weights(self, model: nn.Module) -> None:
         state_dict = self.checkpoint_adapter.load_state_dict(self.model_name_or_path)
         model.load_state_dict(self.checkpoint_adapter.remap_state_dict(state_dict))
 
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        self.noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             self.model_name_or_path,
             subfolder="scheduler",
         )
-        scheduler.set_timesteps(scheduler.config.num_train_timesteps)
-        self.runtime_modules = {
-            "dit": model,
-            "noise_scheduler": scheduler,
-        }
-        return self.runtime_modules
+        self.noise_scheduler.set_timesteps(self.noise_scheduler.config.num_train_timesteps)
 
     def canonicalize_batch(self, raw_batch: dict[str, Any]) -> DenoiseBatch:
         values = {
@@ -83,7 +75,6 @@ class QwenImageRuntime(ModelRuntime):
             timesteps=raw_batch.get("timesteps"),
             noise=raw_batch.get("noise"),
             sample_ids=list(sample_ids),
-            metadata={"raw_batch": raw_batch},
             model_extras=model_extras,
         )
 
@@ -111,11 +102,7 @@ class QwenImageRuntime(ModelRuntime):
             strategies.append(
                 StrategySpec(
                     kind="fsdp1",
-                    config={
-                        "degree": parameter_parallel.degree,
-                        "wrap_block_classes": spec.wrap_block_classes,
-                        "no_shard_modules": spec.no_shard_modules,
-                    },
+                    config={"degree": parameter_parallel.degree},
                 )
             )
 
@@ -154,7 +141,6 @@ class QwenImageRuntime(ModelRuntime):
         return ParallelPlan(
             parameter_degree=parameter_parallel.degree if parameter_parallel is not None else 1,
             sequence_degree=sequence_parallel.degree,
-            strategy_order=tuple(strategy.kind for strategy in strategies),
             strategies=tuple(strategies),
             required_batch_extras=tuple(sorted(required_batch_extras)),
         )

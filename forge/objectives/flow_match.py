@@ -16,17 +16,11 @@ class FlowMatchObjective(TrainingObjective):
         device = first_param.device
         dtype = first_param.dtype
 
-        scheduler = runtime.runtime_modules["noise_scheduler"]
+        scheduler = runtime.noise_scheduler
         latents = batch.latents.to(device=device, dtype=dtype)
         batch.latents = latents
         if batch.prompt_embeds is not None:
             batch.prompt_embeds = batch.prompt_embeds.to(device=device, dtype=dtype)
-        if batch.pooled_embeds is not None:
-            batch.pooled_embeds = batch.pooled_embeds.to(device=device, dtype=dtype)
-        if batch.attention_mask is not None:
-            batch.attention_mask = self._move_value(batch.attention_mask, device=device, dtype=dtype)
-        if batch.image_embeds is not None:
-            batch.image_embeds = self._move_value(batch.image_embeds, device=device, dtype=dtype)
         if batch.model_extras:
             batch.model_extras = {
                 key: self._move_value(value, device=device, dtype=dtype) for key, value in batch.model_extras.items()

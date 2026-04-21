@@ -21,10 +21,9 @@ class ModelRuntime(ABC):
         """Build and return a trainable model."""
 
     @abstractmethod
-    def load_weights(self, model: nn.Module) -> dict[str, Any]:
-        """Load weights and return auxiliary runtime modules."""
+    def load_weights(self, model: nn.Module) -> None:
+        """Load checkpoint weights and attach runtime state."""
 
-    # might be redundant; can be directly mapped to Sample
     @abstractmethod
     def canonicalize_batch(self, raw_batch: dict[str, Any]) -> DenoiseBatch:
         """Convert upstream inputs into a canonical DenoiseBatch."""

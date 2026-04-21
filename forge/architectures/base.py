@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch.nn as nn
@@ -10,12 +10,8 @@ import torch.nn as nn
 @dataclass(frozen=True)
 class ConditionSchema:
     required_fields: tuple[str, ...]
-    optional_fields: tuple[str, ...] = ()
-    forward_arg_map: dict[str, str] = field(default_factory=dict)
 
 
-# Native SP algo supported by diffusers
-# maybe redundant
 @dataclass(frozen=True)
 class NativeSequenceParallelSpec:
     supported_algorithms: tuple[str, ...]
@@ -23,23 +19,9 @@ class NativeSequenceParallelSpec:
     required_batch_extras: tuple[str, ...] = ()
 
 
-# used for models not natively provided with SP algorithms
-@dataclass(frozen=True)
-class PatchedSequenceParallelSpec:
-    required_batch_extras: tuple[str, ...] = ()
-    patch_entrypoint: str | None = None
-
-
 @dataclass(frozen=True)
 class ArchitectureParallelSpec:
-    # what is the wrap basic unit
-    wrap_block_classes: tuple[str, ...] = ()
-    no_shard_modules: tuple[str, ...] = ()
-    # inputs: dimenstion, indicating what dimension to shard on, reserved for future SP
-    shardable_inputs: dict[str, int] = field(default_factory=dict)
-    replicate_inputs: tuple[str, ...] = ()
     native_sequence_parallel: NativeSequenceParallelSpec | None = None
-    patched_sequence_parallel: PatchedSequenceParallelSpec | None = None
 
 
 class ModelArchitecture(ABC):

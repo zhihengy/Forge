@@ -14,7 +14,6 @@ class StrategySpec:
 class ParallelPlan:
     parameter_degree: int = 1
     sequence_degree: int = 1
-    strategy_order: tuple[str, ...] = ()
     strategies: tuple[StrategySpec, ...] = ()
     required_batch_extras: tuple[str, ...] = ()
 

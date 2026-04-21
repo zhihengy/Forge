@@ -6,7 +6,7 @@ import torch
 
 from forge.adapters.qwen_image import QwenImageCheckpointAdapter
 from forge.architectures.qwen_image import QwenImageArchitecture
-from forge.model_cores.qwen_image import QwenImageDiT, QwenImageDiTConfig
+from forge.model_cores.qwen_image import QwenImageDiT, QwenImageDiTConfig, build_joint_attention_mask
 from forge.model_cores.registry import get_model_core
 from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 
@@ -29,10 +29,7 @@ class QwenImageOwnedDiTTest(unittest.TestCase):
         config = make_small_config()
         self.assertIs(get_model_core("qwen_image"), QwenImageDiT)
 
-        architecture = QwenImageArchitecture(
-            model_name_or_path="/tmp/unused",
-            model_config=config,
-        )
+        architecture = QwenImageArchitecture(model_config=config)
         model = architecture.build_model()
         self.assertIsInstance(model, QwenImageDiT)
         self.assertEqual(architecture.parallel_spec.native_sequence_parallel.supported_algorithms, ("ulysses",))
@@ -66,6 +63,25 @@ class QwenImageOwnedDiTTest(unittest.TestCase):
                 joint_attention_dim=10,
                 axes_dims_rope=(2, 2, 4),
             ),
+        )
+
+    def test_build_joint_attention_mask_interleaves_ulysses_shards(self) -> None:
+        text_mask = torch.tensor([[True, True, False, False]], dtype=torch.bool)
+
+        vanilla_mask = build_joint_attention_mask(text_mask, image_seq_len=4)
+        self.assertTrue(
+            torch.equal(
+                vanilla_mask,
+                torch.tensor([[[[True, True, False, False, True, True, True, True]]]], dtype=torch.bool),
+            )
+        )
+
+        ulysses_mask = build_joint_attention_mask(text_mask, image_seq_len=4, ulysses_degree=2)
+        self.assertTrue(
+            torch.equal(
+                ulysses_mask,
+                torch.tensor([[[[True, True, True, True, False, False, True, True]]]], dtype=torch.bool),
+            )
         )
 
     @torch.no_grad()

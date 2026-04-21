@@ -1,32 +1,19 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint import load as dcp_load
-from torch.distributed.checkpoint import save as dcp_save
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
-)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp import ShardingStrategy
 
 from forge.parallel.base import ParallelRuntime
 from forge.parallel.plan import ParallelPlan, StrategySpec
 
 
 class TorchParallelRuntime(ParallelRuntime):
-    def __init__(self, mixed_precision: str = "bf16") -> None:
-        self.mixed_precision = mixed_precision
-        self.model: Any | None = None
-        self.optimizer: Any | None = None
+    def __init__(self) -> None:
         self.use_fsdp = False
         self.sequence_parallel_group: dist.ProcessGroup | None = None
 
@@ -52,12 +39,9 @@ class TorchParallelRuntime(ParallelRuntime):
         if fsdp_strategy is not None:
             model = self._apply_fsdp(model, fsdp_strategy, device)
 
-        self.model = model
         return model
 
-    def prepare_optimizer(self, model: Any, optimizer: Any) -> Any:
-        del model
-        self.optimizer = optimizer
+    def prepare_optimizer(self, optimizer: Any) -> Any:
         return optimizer
 
     def redistribute_batch(self, batch: Any, plan: ParallelPlan) -> Any:
@@ -75,65 +59,6 @@ class TorchParallelRuntime(ParallelRuntime):
         optimizer.zero_grad(set_to_none=True)
         if scheduler is not None:
             scheduler.step()
-
-    def save(self, path: str, state: dict[str, Any]) -> None:
-        if self.model is None:
-            raise RuntimeError("Model has not been prepared")
-        ckpt_dir = Path(path)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(state, ckpt_dir / "trainer_meta.pt")
-        if not self.use_fsdp:
-            torch.save(
-                {
-                    "model": self.model.state_dict(),
-                    "optimizer": self.optimizer.state_dict() if self.optimizer is not None else {},
-                },
-                ckpt_dir / "checkpoint.pt",
-            )
-            return
-        state_dict = {
-            "model": get_model_state_dict(
-                self.model,
-                options=StateDictOptions(full_state_dict=False, cpu_offload=True),
-            ),
-            "optimizer": get_optimizer_state_dict(
-                self.model,
-                self.optimizer,
-                options=StateDictOptions(full_state_dict=False, cpu_offload=True),
-            ) if self.optimizer is not None else {},
-        }
-        dcp_save(state_dict=state_dict, checkpoint_id=ckpt_dir)
-
-    def load(self, path: str, model: Any, optimizer: Any | None = None) -> dict[str, Any]:
-        ckpt_dir = Path(path)
-        meta_path = ckpt_dir / "trainer_meta.pt"
-        meta = torch.load(meta_path, map_location="cpu") if meta_path.exists() else {}
-        if not self.use_fsdp:
-            checkpoint = torch.load(ckpt_dir / "checkpoint.pt", map_location="cpu")
-            model.load_state_dict(checkpoint["model"])
-            if optimizer is not None and checkpoint.get("optimizer"):
-                optimizer.load_state_dict(checkpoint["optimizer"])
-            return meta
-        state_dict = {
-            "model": get_model_state_dict(
-                model,
-                options=StateDictOptions(full_state_dict=False, cpu_offload=True),
-            ),
-            "optimizer": get_optimizer_state_dict(
-                model,
-                optimizer,
-                options=StateDictOptions(full_state_dict=False, cpu_offload=True),
-            ) if optimizer is not None else {},
-        }
-        dcp_load(state_dict=state_dict, checkpoint_id=ckpt_dir)
-        set_model_state_dict(model, model_state_dict=state_dict["model"])
-        if optimizer is not None:
-            set_optimizer_state_dict(
-                model,
-                optimizer,
-                optim_state_dict=state_dict["optimizer"],
-            )
-        return meta
 
     def is_main_process(self) -> bool:
         if not self.is_distributed():
@@ -185,7 +110,6 @@ class TorchParallelRuntime(ParallelRuntime):
             model,
             device_id=device,
             use_orig_params=True,
-            mixed_precision=self._build_mixed_precision(),
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             sync_module_states=True,
         )
@@ -202,15 +126,6 @@ class TorchParallelRuntime(ParallelRuntime):
                 if grad.is_sparse:
                     raise NotImplementedError("Sparse gradients are not supported with self-owned Ulysses yet.")
                 dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sequence_parallel_group)
-
-    def _build_mixed_precision(self) -> Any:
-        if self.mixed_precision == "bf16":
-            dtype = torch.bfloat16
-        elif self.mixed_precision == "fp16":
-            dtype = torch.float16
-        else:
-            dtype = torch.float32
-        return MixedPrecision(param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype)
 
     @staticmethod
     def _get_device() -> torch.device:

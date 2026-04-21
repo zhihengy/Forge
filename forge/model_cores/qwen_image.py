@@ -108,10 +108,10 @@ def apply_rotary_emb_qwen(
 def compute_text_seq_len_from_mask(
     encoder_hidden_states: torch.Tensor,
     encoder_hidden_states_mask: torch.Tensor | None,
-) -> tuple[int, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[int, torch.Tensor | None]:
     batch_size, text_seq_len = encoder_hidden_states.shape[:2]
     if encoder_hidden_states_mask is None:
-        return text_seq_len, None, None
+        return text_seq_len, None
 
     if encoder_hidden_states_mask.shape[:2] != (batch_size, text_seq_len):
         raise ValueError(
@@ -120,16 +120,36 @@ def compute_text_seq_len_from_mask(
         )
     if encoder_hidden_states_mask.dtype != torch.bool:
         encoder_hidden_states_mask = encoder_hidden_states_mask.to(torch.bool)
+    return text_seq_len, encoder_hidden_states_mask
 
-    position_ids = torch.arange(text_seq_len, device=encoder_hidden_states.device, dtype=torch.long)
-    active_positions = torch.where(encoder_hidden_states_mask, position_ids, position_ids.new_zeros(()))
-    has_active = encoder_hidden_states_mask.any(dim=1)
-    per_sample_len = torch.where(
-        has_active,
-        active_positions.max(dim=1).values + 1,
-        torch.as_tensor(text_seq_len, device=encoder_hidden_states.device),
-    )
-    return text_seq_len, per_sample_len, encoder_hidden_states_mask
+
+def build_joint_attention_mask(
+    encoder_hidden_states_mask: torch.Tensor,
+    *,
+    image_seq_len: int,
+    ulysses_degree: int = 1,
+) -> torch.Tensor:
+    batch_size = encoder_hidden_states_mask.shape[0]
+    image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=encoder_hidden_states_mask.device)
+    if ulysses_degree <= 1:
+        joint_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+        return joint_mask[:, None, None, :]
+
+    text_seq_len = encoder_hidden_states_mask.shape[1]
+    if text_seq_len % ulysses_degree != 0 or image_seq_len % ulysses_degree != 0:
+        raise ValueError(
+            "Ulysses attention mask construction expects both text and image sequence lengths "
+            f"to be divisible by degree={ulysses_degree}, got text_seq_len={text_seq_len}, image_seq_len={image_seq_len}."
+        )
+
+    interleaved_chunks: list[torch.Tensor] = []
+    text_chunks = encoder_hidden_states_mask.chunk(ulysses_degree, dim=1)
+    image_chunks = image_mask.chunk(ulysses_degree, dim=1)
+    for text_chunk, image_chunk in zip(text_chunks, image_chunks, strict=True):
+        interleaved_chunks.extend((text_chunk, image_chunk))
+
+    joint_mask = torch.cat(interleaved_chunks, dim=1)
+    return joint_mask[:, None, None, :]
 
 
 def run_ulysses_attention(
@@ -441,11 +461,9 @@ class QwenDoubleStreamAttnProcessor2_0:
         attn: Attention,
         hidden_states: torch.FloatTensor,
         encoder_hidden_states: torch.FloatTensor | None = None,
-        encoder_hidden_states_mask: torch.FloatTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del encoder_hidden_states_mask
         if encoder_hidden_states is None:
             raise ValueError("QwenDoubleStreamAttnProcessor2_0 requires encoder_hidden_states (text stream).")
 
@@ -579,7 +597,6 @@ class QwenImageTransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        encoder_hidden_states_mask: torch.Tensor | None,
         temb: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
@@ -596,7 +613,6 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = self.attn(
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=image_rotary_emb,
             **(joint_attention_kwargs or {}),
         )
@@ -618,9 +634,7 @@ class QwenImageTransformerBlock(nn.Module):
 
 
 class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin, AttentionMixin):
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["QwenImageTransformerBlock"]
-    _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     @register_to_config
@@ -668,7 +682,6 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
         )
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
-        self.gradient_checkpointing = False
         self.zero_cond_t = zero_cond_t
         self._ulysses_context: UlyssesParallelContext | None = None
 
@@ -736,7 +749,7 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
             modulate_index = None
 
         encoder_hidden_states = self.txt_in(self.txt_norm(encoder_hidden_states))
-        text_seq_len, _, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
+        text_seq_len, encoder_hidden_states_mask = compute_text_seq_len_from_mask(
             encoder_hidden_states,
             encoder_hidden_states_mask,
         )
@@ -752,11 +765,12 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
 
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
         if encoder_hidden_states_mask is not None:
-            batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-            block_attention_kwargs["attention_mask"] = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)[
-                :, None, None, :
-            ]
+            image_seq_len = hidden_states.shape[1]
+            block_attention_kwargs["attention_mask"] = build_joint_attention_mask(
+                encoder_hidden_states_mask,
+                image_seq_len=image_seq_len,
+                ulysses_degree=ulysses_context.degree if ulysses_context is not None else 1,
+            )
 
         if ulysses_context is not None and ulysses_context.degree > 1:
             if controlnet_block_samples is not None:
@@ -768,27 +782,14 @@ class QwenImageDiT(BaseDiT, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixi
                 modulate_index = shard_tensor(modulate_index, dim=1, context=ulysses_context)
 
         for index_block, block in enumerate(self.transformer_blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    None,
-                    temb,
-                    image_rotary_emb,
-                    block_attention_kwargs,
-                    modulate_index,
-                )
-            else:
-                encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_hidden_states_mask=None,
-                    temb=temb,
-                    image_rotary_emb=image_rotary_emb,
-                    joint_attention_kwargs=block_attention_kwargs,
-                    modulate_index=modulate_index,
-                )
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+                joint_attention_kwargs=block_attention_kwargs,
+                modulate_index=modulate_index,
+            )
 
             if controlnet_block_samples is not None:
                 interval_control = int(np.ceil(len(self.transformer_blocks) / len(controlnet_block_samples)))
